@@ -1,0 +1,89 @@
+# Anzeige-Sensor für das Musik-Display
+#
+# Bildet dieselbe Logik ab wie die button-card im Dashboard (mdtv2-tools):
+#   Plattenspieler (sensor.mdt_phono) vor anderer Bus-Quelle (sensor.mdt_ml_listen),
+#   dann N.MUSIC über einen anderen Provider als Sendspin/MA (sensor.mdt_n_music),
+#   sonst N.MUSIC über Music Assistant.
+# Das Display liest nur diesen einen Sensor für Kopfzeile, Titel, Interpret
+# und das Bild bei Plattenspieler, CD & Co.
+#
+# Zustand: phono | bus | ext | nmusic | aus
+#
+# Gibt es in der configuration.yaml schon "template:", nur den Teil ab
+# "- sensor:" dort anhängen.
+
+template:
+  - sensor:
+      - name: Musik Display
+        unique_id: musik_display
+        icon: mdi:music-box
+        state: >-
+          {%- set phono = is_state('sensor.mdt_phono', 'playing') -%}
+          {%- set bus = not phono and is_state('sensor.mdt_ml_listen', 'playing') -%}
+          {%- set prov = state_attr('sensor.mdt_n_music', 'provider') or '' -%}
+          {%- set ext = is_state('sensor.mdt_n_music', 'playing') and prov not in ['', 'sendspin'] -%}
+          {%- set nm = states('sensor.n_music_quelle') not in ['–', 'unknown', 'unavailable', ''] -%}
+          {{ 'phono' if phono else 'bus' if bus else 'ext' if ext else 'nmusic' if nm else 'aus' }}
+        attributes:
+          kopf: >-
+            {%- set phono_label = 'BG7000' -%}
+            {%- set p = states.sensor.mdt_phono -%}
+            {%- set b = states.sensor.mdt_ml_listen -%}
+            {%- set phono = is_state('sensor.mdt_phono', 'playing') -%}
+            {%- set bus = not phono and is_state('sensor.mdt_ml_listen', 'playing') -%}
+            {%- if phono -%}
+              {%- set album = p.attributes.album | default('') if p.attributes.artist | default('') else '' -%}
+              {{ phono_label ~ (' · ' ~ album if album else '') }}
+            {%- elif bus -%}
+              {%- set a = b.attributes -%}
+              {{ [a.source | default(''),
+                  ('Titel ' ~ a.track) if a.track | default('') else '',
+                  a.album | default('') if a.artist | default('') else ''] | select | join(' · ') }}
+            {%- else -%}
+              {%- set q = states('sensor.n_music_quelle') -%}
+              {%- set i = states('sensor.n_music_inhalt') -%}
+              {{ 'N.MUSIC · ' ~ ((q ~ ' · ' ~ i) if i not in ['', '–', 'unknown', 'unavailable'] else q) }}
+            {%- endif -%}
+          titel: >-
+            {%- set phono = is_state('sensor.mdt_phono', 'playing') -%}
+            {%- set bus = not phono and is_state('sensor.mdt_ml_listen', 'playing') -%}
+            {%- set prov = state_attr('sensor.mdt_n_music', 'provider') or '' -%}
+            {%- set ext = is_state('sensor.mdt_n_music', 'playing') and prov not in ['', 'sendspin'] -%}
+            {%- if phono -%}
+              {{ state_attr('sensor.mdt_phono', 'title') or '' if state_attr('sensor.mdt_phono', 'artist') else 'Schallplatte' }}
+            {%- elif bus -%}
+              {{ state_attr('sensor.mdt_ml_listen', 'title') or '' if state_attr('sensor.mdt_ml_listen', 'artist')
+                 else state_attr('sensor.mdt_ml_listen', 'source') or '' }}
+            {%- elif ext -%}
+              {{ state_attr('sensor.mdt_n_music', 'title') or '' }}
+            {%- else -%}
+              {{ state_attr('media_player.masterlink_bridge_ma', 'media_title') or '' }}
+            {%- endif -%}
+          interpret: >-
+            {%- set phono = is_state('sensor.mdt_phono', 'playing') -%}
+            {%- set bus = not phono and is_state('sensor.mdt_ml_listen', 'playing') -%}
+            {%- set prov = state_attr('sensor.mdt_n_music', 'provider') or '' -%}
+            {%- set ext = is_state('sensor.mdt_n_music', 'playing') and prov not in ['', 'sendspin'] -%}
+            {%- if phono -%}
+              {{ state_attr('sensor.mdt_phono', 'artist') or '' }}
+            {%- elif bus -%}
+              {{ state_attr('sensor.mdt_ml_listen', 'artist') or '' }}
+            {%- elif ext -%}
+              {{ state_attr('sensor.mdt_n_music', 'artist') or '' }}
+            {%- else -%}
+              {{ state_attr('media_player.masterlink_bridge_ma', 'media_artist') or '' }}
+            {%- endif -%}
+          # Bild nur für Plattenspieler, Bus-Quelle und Fremd-Provider (sonst leer:
+          # dann nutzt das Display wie bisher das Cover bzw. Senderlogo von MA)
+          bild: >-
+            {%- set phono = is_state('sensor.mdt_phono', 'playing') -%}
+            {%- set bus = not phono and is_state('sensor.mdt_ml_listen', 'playing') -%}
+            {%- set prov = state_attr('sensor.mdt_n_music', 'provider') or '' -%}
+            {%- set ext = is_state('sensor.mdt_n_music', 'playing') and prov not in ['', 'sendspin'] -%}
+            {%- if phono -%}
+              {{ state_attr('sensor.mdt_phono', 'cover_url') or '' if state_attr('sensor.mdt_phono', 'artist') else '' }}
+            {%- elif bus -%}
+              {{ state_attr('sensor.mdt_ml_listen', 'cover_url') or '' if state_attr('sensor.mdt_ml_listen', 'artist') else '' }}
+            {%- elif ext -%}
+              {{ state_attr('sensor.mdt_n_music', 'cover_url') or '' }}
+            {%- endif -%}

@@ -1,0 +1,42 @@
+# Raumbezug für die Musik-Displays
+#
+# Jedes Display hat in HA eine Text-Entität "Raumplayer". Dort trägst du die
+# B&O-Player dieses Raums ein, kommagetrennt, z. B.:
+#   media_player.beovision_10, media_player.beolab_3500
+# Der Sensor unten wird "an", sobald einer davon läuft. Nur dann zeigt das
+# Display Cover und Titel; sonst bleibt es auf der Wetterseite.
+# Leere Liste = Display reagiert auf jede Musik.
+#
+# Pro Display ein Eintrag: Namen anpassen (z. B. "Musik-Display Bad Raum aktiv"
+# mit text.musik_display_bad_raumplayer). Die Entity-ID muss im Display unter
+# substitutions bei raum_sensor stehen.
+#
+# Gibt es in der configuration.yaml schon "template:", nur den Teil ab
+# "- binary_sensor:" dort anhängen.
+
+template:
+  - binary_sensor:
+      - name: Musik-Display Raum aktiv
+        unique_id: musik_display_raum_aktiv
+        icon: mdi:speaker-wireless
+        state: >-
+          {%- set liste = states('text.musik_display_raumplayer') -%}
+          {%- set player = (liste if liste not in ['unknown', 'unavailable'] else '')
+                .split(',') | map('trim') | select | list -%}
+          {%- if player | count == 0 -%}
+            true
+          {%- else -%}
+            {{ player | select('is_state', ['playing', 'on', 'paused']) | list | count > 0 }}
+          {%- endif -%}
+        attributes:
+          laufende_player: >-
+            {%- set liste = states('text.musik_display_raumplayer') -%}
+            {%- set player = (liste if liste not in ['unknown', 'unavailable'] else '')
+                  .split(',') | map('trim') | select | list -%}
+            {{ player | select('is_state', ['playing', 'on', 'paused']) | list | join(', ') }}
+ 
+      # Beispiel für ein zweites Display (Bad):
+      # - name: Musik-Display Bad Raum aktiv
+      #   unique_id: musik_display_bad_raum_aktiv
+      #   state: >-
+      #     ... wie oben, mit text.musik_display_bad_raumplayer

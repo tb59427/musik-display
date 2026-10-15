@@ -1,0 +1,42 @@
+# Helligkeits-Sensor für das Musik-Display
+#
+# Aus einem Lichtsensor im Raum (lux_entity anpassen), solange der in den
+# letzten 30 Minuten etwas gemeldet hat; sonst nach Sonnenstand.
+#
+# Gibt es in der configuration.yaml schon "template:", nur den Teil ab
+# "- sensor:" dort anhängen.
+
+template:
+  - sensor:
+      - name: Display Helligkeit
+        unique_id: display_helligkeit
+        unit_of_measurement: "%"
+        icon: mdi:brightness-6
+        state: >-
+          {%- set lux_entity = 'sensor.lichtsensor_illuminance' -%}
+          {%- set dunkel = 40 -%}
+          {%- set licht_an = 150 -%}
+          {%- set s = states[lux_entity] -%}
+          {%- set lux = states(lux_entity) | float(-1) -%}
+          {%- set frisch = s is not none and lux >= 0
+                and (now() - s.last_reported) < timedelta(minutes=30) -%}
+          {%- if frisch -%}
+            {%- if lux < dunkel -%} 30
+            {%- elif lux < licht_an -%} 50
+            {%- else -%} 100
+            {%- endif -%}
+          {%- else -%}
+            {%- set e = state_attr('sun.sun', 'elevation') | float(0) -%}
+            {%- if e < -6 -%} 20
+            {%- elif e < 0 -%} 40
+            {%- elif e < 10 -%} 70
+            {%- else -%} 100
+            {%- endif -%}
+          {%- endif -%}
+        attributes:
+          quelle: >-
+            {%- set lux_entity = 'sensor.lichtsensor_illuminance' -%}
+            {%- set s = states[lux_entity] -%}
+            {%- set lux = states(lux_entity) | float(-1) -%}
+            {{ 'Lichtsensor' if s is not none and lux >= 0
+                 and (now() - s.last_reported) < timedelta(minutes=30) else 'Sonnenstand' }}

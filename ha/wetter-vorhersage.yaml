@@ -1,0 +1,117 @@
+# Vorhersage-Sensor für das Musik-Display (Wetterseite)
+#
+# Aktuelles Wetter ("jetzt"): aus der METAR-Meldung eines nahen Flugplatzes
+# (sensor.metar_raw, optional), solange diese höchstens 2 Stunden alt ist;
+# sonst aus dem Wetterdienst. Vorhersage (4 Tage): aus sensor.wetter_daily
+# (siehe wetter-daily.yaml).
+#
+# Gibt es in der configuration.yaml schon "template:", nur den Teil ab
+# "- sensor:" dort anhängen.
+
+template:
+  - sensor:
+      - name: Wetter Vorhersage Display
+        unique_id: wetter_vorhersage_display
+        icon: mdi:weather-partly-cloudy
+        state: >-
+          {%- set f = state_attr('sensor.wetter_daily', 'forecast') or [] -%}
+          {{ f[0].condition if f | count > 0 else 'unknown' }}
+        attributes:
+          # aktueller Zustand aus METAR (Wettererscheinungen, Sicht, Bewölkung), sonst DWD
+          jetzt_zustand: >-
+            {%- set m = 'sensor.metar_raw' -%}
+            {%- set obs = state_attr(m, 'observed_at') | string -%}
+            {%- set frisch = obs not in ['None', ''] and
+                  (now() - as_datetime(obs ~ ('' if ('+' in obs or 'Z' in obs) else '+00:00'))) < timedelta(hours=2) -%}
+            {%- if frisch -%}
+              {%- set wx = state_attr(m, 'weather') | string -%}
+              {%- set cl = state_attr(m, 'clouds') | string -%}
+              {%- set vis = state_attr(m, 'visibility_m') | float(10000) -%}
+              {%- if wx is search('TS') -%}{{ 'lightning-rainy' if wx is search('RA|DZ|SH') else 'lightning' }}
+              {%- elif wx is search('GR|GS') -%}hail
+              {%- elif wx is search('SN|SG|PL') -%}{{ 'snowy-rainy' if wx is search('RA|DZ') else 'snowy' }}
+              {%- elif wx is search('\\+(SH)?RA|\\+DZ') -%}pouring
+              {%- elif wx is search('RA|DZ') -%}rainy
+              {%- elif wx is search('FG|BR|HZ') or vis < 5000 -%}fog
+              {%- elif cl is search('OVC|BKN') -%}cloudy
+              {%- elif cl is search('SCT|FEW') -%}partlycloudy
+              {%- else -%}{{ 'clear-night' if is_state('sun.sun', 'below_horizon') else 'sunny' }}
+              {%- endif -%}
+            {%- else -%}
+              {%- set valid = ['clear-night','cloudy','exceptional','fog','hail','lightning',
+                               'lightning-rainy','partlycloudy','pouring','rainy','snowy',
+                               'snowy-rainy','sunny','windy','windy-variant'] -%}
+              {%- set s = states('sensor.wetter_daily') -%}
+              {%- set f = state_attr('sensor.wetter_daily', 'forecast') or [] -%}
+              {{ s if s in valid else (f[0].condition if f | count > 0 else '') }}
+            {%- endif -%}
+          # aktuelle Temperatur aus METAR, sonst DWD
+          jetzt_temp: >-
+            {%- set m = 'sensor.metar_raw' -%}
+            {%- set obs = state_attr(m, 'observed_at') | string -%}
+            {%- set frisch = obs not in ['None', ''] and
+                  (now() - as_datetime(obs ~ ('' if ('+' in obs or 'Z' in obs) else '+00:00'))) < timedelta(hours=2) -%}
+            {%- set t = state_attr(m, 'temperature_c') if frisch else state_attr('sensor.wetter_daily', 'temperature') -%}
+            {{ t | float(0) | round(0) | int if t is not none else '' }}
+          # woher "jetzt" gerade kommt (zur Kontrolle)
+          jetzt_quelle: >-
+            {%- set obs = state_attr('sensor.metar_raw', 'observed_at') | string -%}
+            {%- set frisch = obs not in ['None', ''] and
+                  (now() - as_datetime(obs ~ ('' if ('+' in obs or 'Z' in obs) else '+00:00'))) < timedelta(hours=2) -%}
+            {{ 'METAR' if frisch else 'DWD' }}
+          d1_tag: >-
+            {%- set f = state_attr('sensor.wetter_daily', 'forecast') or [] -%}
+            {%- if f | count > 0 -%}
+              {%- set d = as_datetime(f[0].datetime).date() -%}
+              {{ 'Heute' if d == now().date() else ['Mo','Di','Mi','Do','Fr','Sa','So'][d.weekday()] }}
+            {%- endif -%}
+          d1_zustand: >-
+            {%- set f = state_attr('sensor.wetter_daily', 'forecast') or [] -%}
+            {{ f[0].condition if f | count > 0 else '' }}
+          d1_temp: >-
+            {%- set f = state_attr('sensor.wetter_daily', 'forecast') or [] -%}
+            {%- if f | count > 0 -%}
+              {{ f[0].temperature | round(0) | int }}° / {{ f[0].templow | round(0) | int if f[0].templow is defined else '–' }}°
+            {%- endif -%}
+          d2_tag: >-
+            {%- set f = state_attr('sensor.wetter_daily', 'forecast') or [] -%}
+            {%- if f | count > 1 -%}
+              {%- set d = as_datetime(f[1].datetime).date() -%}
+              {{ 'Heute' if d == now().date() else ['Mo','Di','Mi','Do','Fr','Sa','So'][d.weekday()] }}
+            {%- endif -%}
+          d2_zustand: >-
+            {%- set f = state_attr('sensor.wetter_daily', 'forecast') or [] -%}
+            {{ f[1].condition if f | count > 1 else '' }}
+          d2_temp: >-
+            {%- set f = state_attr('sensor.wetter_daily', 'forecast') or [] -%}
+            {%- if f | count > 1 -%}
+              {{ f[1].temperature | round(0) | int }}° / {{ f[1].templow | round(0) | int if f[1].templow is defined else '–' }}°
+            {%- endif -%}
+          d3_tag: >-
+            {%- set f = state_attr('sensor.wetter_daily', 'forecast') or [] -%}
+            {%- if f | count > 2 -%}
+              {%- set d = as_datetime(f[2].datetime).date() -%}
+              {{ 'Heute' if d == now().date() else ['Mo','Di','Mi','Do','Fr','Sa','So'][d.weekday()] }}
+            {%- endif -%}
+          d3_zustand: >-
+            {%- set f = state_attr('sensor.wetter_daily', 'forecast') or [] -%}
+            {{ f[2].condition if f | count > 2 else '' }}
+          d3_temp: >-
+            {%- set f = state_attr('sensor.wetter_daily', 'forecast') or [] -%}
+            {%- if f | count > 2 -%}
+              {{ f[2].temperature | round(0) | int }}° / {{ f[2].templow | round(0) | int if f[2].templow is defined else '–' }}°
+            {%- endif -%}
+          d4_tag: >-
+            {%- set f = state_attr('sensor.wetter_daily', 'forecast') or [] -%}
+            {%- if f | count > 3 -%}
+              {%- set d = as_datetime(f[3].datetime).date() -%}
+              {{ 'Heute' if d == now().date() else ['Mo','Di','Mi','Do','Fr','Sa','So'][d.weekday()] }}
+            {%- endif -%}
+          d4_zustand: >-
+            {%- set f = state_attr('sensor.wetter_daily', 'forecast') or [] -%}
+            {{ f[3].condition if f | count > 3 else '' }}
+          d4_temp: >-
+            {%- set f = state_attr('sensor.wetter_daily', 'forecast') or [] -%}
+            {%- if f | count > 3 -%}
+              {{ f[3].temperature | round(0) | int }}° / {{ f[3].templow | round(0) | int if f[3].templow is defined else '–' }}°
+            {%- endif -%}

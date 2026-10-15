@@ -1,0 +1,1500 @@
+# ESPHome-Konfiguration: Guition ESP32-S3-4848S040 (4", 480x480) als Musik-Anzeige
+# Nutzt dieselben Entities wie die button-card im Dashboard.
+
+substitutions:
+  name: musik-display
+  friendly_name: Musik-Display
+  # Music-Assistant-Player der Masterlink-Bridge (liefert Zustand, Titel, Interpret)
+  ma_player: media_player.masterlink_bridge_ma
+  # Template-Sensoren für die Kopfzeile, wie in der Dashboard-Karte
+  quelle_sensor: sensor.n_music_quelle
+  inhalt_sensor: sensor.n_music_inhalt
+  # Template-Sensor mit der Logo-URL des laufenden Senders
+  logo_sensor: sensor.n_music_logo
+  # Anzeige-Sensor mit derselben Logik wie die Dashboard-Karte (ha/musik-display-sensor.yaml)
+  anzeige_sensor: sensor.musik_display
+  # Ist im Raum dieses Displays einer der Raumplayer an? (ha/raum-aktiv.yaml)
+  raum_sensor: binary_sensor.musik_display_raum_aktiv
+  # Wetter: Quelle für die aktuelle Temperatur und aufbereitete Vorhersage
+  # (Vorhersage-Sensor siehe ha/wetter-vorhersage.yaml)
+  weather_entity: sensor.wetter_daily
+  forecast_sensor: sensor.wetter_vorhersage_display
+  # Home Assistant im LAN: externe Cover werden über HA geladen (spart TLS-Speicher am Display).
+  # IP-Adresse statt .local, der ESP32 löst mDNS-Namen hier nicht auf.
+  ha_url: "http://192.168.1.10:8123"
+  # Helligkeit der Wetterseite tagsüber und Nachtruhe (Display aus)
+  helligkeit_wetter: "70%"
+  # Bei laufender Musik per Antippen aufgerufene Wetterseite: Rückkehr zur Musik nach
+  wetter_anzeigedauer: 30s
+  # Zielhelligkeit aus HA (Raumlicht bzw. Sonnenstand), siehe ha/display-helligkeit.yaml
+  helligkeit_sensor: sensor.display_helligkeit
+  nacht_von: "23"
+  nacht_bis: "6"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: y
+      CONFIG_ESP32S3_DATA_CACHE_64KB: y
+      # Bilder dekodieren dauert teils mehrere Sekunden -> Watchdog nicht zu früh auslösen
+      CONFIG_ESP_TASK_WDT_TIMEOUT_S: "15"
+      # Verschlüsselung (HTTPS) und Bild-Decoder ins PSRAM statt in den knappen internen Speicher
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: y
+      CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL: "4096"
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: DEBUG
+  hardware_uart: UART0
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Fallback-Hotspot, falls das WLAN nicht erreichbar ist
+  ap:
+    ssid: "Musik-Display Fallback"
+    password: !secret fallback_ap_password
+
+# Webseite im Fallback-Hotspot zum Eintragen der WLAN-Zugangsdaten
+captive_portal:
+
+# Diagnose: Neustartgrund und freier Speicher (in HA sichtbar)
+debug:
+  update_interval: 30s
+
+# Liste der Raumplayer, in HA einstellbar (kommagetrennte Entity-IDs).
+# Leer = Display reagiert auf jede Musik (wie bisher).
+text:
+  - platform: template
+    name: Raumplayer
+    id: raumplayer
+    icon: mdi:speaker-multiple
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: ""
+    max_length: 255
+
+# --- Hardware -------------------------------------------------------------
+
+# SPI nur für die Init-Sequenz des ST7701S-Controllers
+spi:
+  clk_pin: GPIO48
+  mosi_pin: GPIO47
+
+# Touch-Controller GT911
+i2c:
+  sda: GPIO19
+  scl: GPIO45
+
+display:
+  - platform: mipi_rgb
+    model: GUITION-4848S040
+    id: main_display
+    update_interval: never
+    auto_clear_enabled: false
+
+touchscreen:
+  - platform: gt911
+    id: main_touch
+    display: main_display
+    # Antippen: bei Musik zwischen Musik- und Wetterseite umschalten,
+    # sonst 60 s volle Helligkeit (auch nachts)
+    on_touch:
+      - script.execute: touch_action
+
+output:
+  - platform: ledc
+    pin: GPIO38
+    id: backlight_out
+
+light:
+  - platform: monochromatic
+    name: Hintergrundbeleuchtung
+    id: backlight
+    output: backlight_out
+    restore_mode: ALWAYS_ON
+    # ohne Gammakorrektur entspricht der Prozentwert der tatsächlichen Helligkeit
+    gamma_correct: 1.0
+
+# --- Uhrzeit aus Home Assistant -------------------------------------------
+
+time:
+  - platform: homeassistant
+    id: ha_time
+    timezone: Europe/Berlin
+    on_time_sync:
+      - script.execute: update_clock
+    on_time:
+      # jede volle Minute
+      - seconds: 0
+        then:
+          - script.execute: update_clock
+          - script.execute: set_mode
+      # Vorbeugender Neustart nachts um 4 Uhr, sofern keine Musik läuft
+      - seconds: 0
+        minutes: 0
+        hours: 4
+        then:
+          - if:
+              condition:
+                lambda: 'return id(ma_state).state != "playing";'
+              then:
+                - logger.log: "Nächtlicher Neustart"
+                - lambda: 'App.safe_reboot();'
+
+
+# --- Selbstheilung ----------------------------------------------------------
+
+interval:
+  # Hängt ein Bild-Download länger als 90 s, wird er verworfen und neu versucht.
+  # Passiert das zweimal hintereinander, startet das Display neu.
+  - interval: 30s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(img_busy) && (millis() - id(busy_since)) > 90000;'
+          then:
+            - lambda: |-
+                id(stuck_count)++;
+                ESP_LOGW("bild", "Download hängt seit über 90 s (Nr. %d), setze zurück", id(stuck_count));
+                id(img_busy) = false;
+                id(shown_url) = "";
+                if (id(stuck_count) >= 2) {
+                  ESP_LOGW("bild", "Download hängt wiederholt, Neustart");
+                  App.safe_reboot();
+                }
+            - script.execute: process_picture
+
+# --- Album-Cover ----------------------------------------------------------
+
+http_request:
+  verify_ssl: false
+  # HA lädt externe Cover erst selbst herunter, bevor es antwortet -> mehr Geduld
+  timeout: 20s
+  watchdog_timeout: 30s
+
+online_image:
+  # Cover als JPEG (MA liefert über seinen Imageproxy auf Wunsch immer JPEG)
+  - id: cover_img
+    url: "http://127.0.0.1/cover.jpg"
+    format: JPEG
+    type: RGB565
+    resize: 480x480
+    update_interval: never
+    on_download_finished:
+      - lambda: 'id(img_busy) = false; id(stuck_count) = 0;'
+      # nur anzeigen, wenn das Bild noch gewünscht ist (Quelle nicht inzwischen gewechselt)
+      - if:
+          condition:
+            lambda: 'return id(pending_url) == id(target_key);'
+          then:
+            - lvgl.image.update:
+                id: img_cover
+                src: cover_img
+            - lvgl.widget.show: img_cover
+            - lambda: 'id(shown_url) = id(pending_url); id(shown_kind) = 1;'
+          else:
+            - logger.log: "Bild veraltet, wird nicht angezeigt"
+    on_error:
+      - logger.log:
+          format: "Cover (JPEG) konnte nicht geladen werden (%s), versuche Senderlogo"
+          args: ['id(target_url).c_str()']
+      - lambda: 'id(img_busy) = false; id(shown_url) = ""; id(shown_kind) = 0;'
+      - delay: 1500ms
+      - wait_until:
+          condition:
+            lambda: 'return heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) > 30000;'
+          timeout: 20s
+      - script.execute: load_station_logo
+  # Fallback für PNG-Logos, die nicht über den MA-Imageproxy kommen
+  - id: cover_png
+    url: "http://127.0.0.1/cover.png"
+    format: PNG
+    type: RGB565
+    resize: 480x480
+    update_interval: never
+    on_download_finished:
+      - lambda: 'id(img_busy) = false; id(stuck_count) = 0;'
+      # nur anzeigen, wenn das Bild noch gewünscht ist (Quelle nicht inzwischen gewechselt)
+      - if:
+          condition:
+            lambda: 'return id(pending_url) == id(target_key);'
+          then:
+            - lvgl.image.update:
+                id: img_cover
+                src: cover_png
+            - lvgl.widget.show: img_cover
+            - lambda: 'id(shown_url) = id(pending_url); id(shown_kind) = 2;'
+          else:
+            - logger.log: "Bild veraltet, wird nicht angezeigt"
+    on_error:
+      - logger.log: "Cover (PNG) konnte nicht geladen werden, versuche Senderlogo"
+      - lambda: 'id(img_busy) = false; id(shown_url) = ""; id(shown_kind) = 0;'
+      - delay: 1500ms
+      - wait_until:
+          condition:
+            lambda: 'return heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) > 30000;'
+          timeout: 20s
+      - script.execute: load_station_logo
+  # Senderlogos aus sensor.n_music_logo (JPG oder PNG)
+  - id: logo_jpg
+    url: "http://127.0.0.1/logo.jpg"
+    format: JPEG
+    type: RGB565
+    resize: 480x480
+    update_interval: never
+    on_download_finished:
+      - lambda: 'id(img_busy) = false; id(stuck_count) = 0;'
+      # nur anzeigen, wenn das Bild noch gewünscht ist (Quelle nicht inzwischen gewechselt)
+      - if:
+          condition:
+            lambda: 'return id(pending_url) == id(target_key);'
+          then:
+            - lvgl.image.update:
+                id: img_cover
+                src: logo_jpg
+            - lvgl.widget.show: img_cover
+            - lambda: 'id(shown_url) = id(pending_url); id(shown_kind) = 3;'
+          else:
+            - logger.log: "Bild veraltet, wird nicht angezeigt"
+    on_error:
+      - logger.log: "Senderlogo (JPG) konnte nicht geladen werden"
+      - lambda: 'id(img_busy) = false; id(shown_url) = ""; id(shown_kind) = 0;'
+      - lvgl.widget.hide: img_cover
+  - id: logo_png
+    url: "http://127.0.0.1/logo.png"
+    format: PNG
+    type: RGB565
+    resize: 480x480
+    update_interval: never
+    on_download_finished:
+      - lambda: 'id(img_busy) = false; id(stuck_count) = 0;'
+      # nur anzeigen, wenn das Bild noch gewünscht ist (Quelle nicht inzwischen gewechselt)
+      - if:
+          condition:
+            lambda: 'return id(pending_url) == id(target_key);'
+          then:
+            - lvgl.image.update:
+                id: img_cover
+                src: logo_png
+            - lvgl.widget.show: img_cover
+            - lambda: 'id(shown_url) = id(pending_url); id(shown_kind) = 4;'
+          else:
+            - logger.log: "Bild veraltet, wird nicht angezeigt"
+    on_error:
+      - logger.log: "Senderlogo (PNG) konnte nicht geladen werden"
+      - lambda: 'id(img_busy) = false; id(shown_url) = ""; id(shown_kind) = 0;'
+      - lvgl.widget.hide: img_cover
+
+# --- Wetter-Hintergründe (Dateien im ESPHome-Ordner unter wetter/) --------
+# Die Dateien haben bereits 480 × 480 Pixel (Vergrößern beim Build oder zur
+# Laufzeit funktioniert nicht).
+
+image:
+  - file: wetter/sonne.png
+    id: bg_sonne
+    type: RGB565
+  - file: wetter/nacht.png
+    id: bg_nacht
+    type: RGB565
+  - file: wetter/wolkig.png
+    id: bg_wolkig
+    type: RGB565
+  - file: wetter/bedeckt.png
+    id: bg_bedeckt
+    type: RGB565
+  - file: wetter/regen.png
+    id: bg_regen
+    type: RGB565
+  - file: wetter/gewitter.png
+    id: bg_gewitter
+    type: RGB565
+  - file: wetter/schnee.png
+    id: bg_schnee
+    type: RGB565
+  # Rückfallbilder für Plattenspieler und CD (ohne erkanntes Album)
+  - file: wetter/platte.png
+    id: bg_platte
+    type: RGB565
+  - file: wetter/cd.png
+    id: bg_cd
+    type: RGB565
+
+# --- Schriften (mit Umlauten!) --------------------------------------------
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 24
+    bpp: 4
+    glyphsets: [GF_Latin_Core]
+  - file: "gfonts://Roboto@700"
+    id: font_big
+    size: 38
+    bpp: 4
+    glyphsets: [GF_Latin_Core]
+
+  # Uhr und große Temperatur: nur die nötigen Zeichen, spart Speicher
+  - file: "gfonts://Roboto@700"
+    id: font_clock
+    size: 88
+    bpp: 4
+    glyphs: "0123456789:"
+  - file: "gfonts://Roboto@300"
+    id: font_temp
+    size: 72
+    bpp: 4
+    glyphs: "0123456789-°"
+  # Wettersymbole (Material Design Icons)
+  - file:
+      type: web
+      url: "https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/master/fonts/materialdesignicons-webfont.ttf"
+    id: font_icon_big
+    size: 120
+    bpp: 4
+    glyphs: &weather_glyphs
+      - "\U000F0594"  # clear-night
+      - "\U000F0590"  # cloudy
+      - "\U000F05D6"  # exceptional / unbekannt
+      - "\U000F0591"  # fog
+      - "\U000F0592"  # hail
+      - "\U000F0593"  # lightning
+      - "\U000F067E"  # lightning-rainy
+      - "\U000F0595"  # partlycloudy
+      - "\U000F0596"  # pouring
+      - "\U000F0597"  # rainy
+      - "\U000F0598"  # snowy
+      - "\U000F067F"  # snowy-rainy
+      - "\U000F0599"  # sunny
+      - "\U000F059D"  # windy
+      - "\U000F059E"  # windy-variant
+  - file:
+      type: web
+      url: "https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/master/fonts/materialdesignicons-webfont.ttf"
+    id: font_icon_small
+    size: 56
+    bpp: 4
+    glyphs: *weather_glyphs
+
+# --- Oberfläche -----------------------------------------------------------
+
+lvgl:
+  displays: main_display
+  touchscreens: main_touch
+  buffer_size: 25%
+  pages:
+    - id: page_music
+      bg_color: 0x000000
+      widgets:
+        # Cover als Hintergrund
+        - image:
+            id: img_cover
+            src: cover_img
+            align: CENTER
+            hidden: true
+        # Dunkle Ebene darüber, damit der Text lesbar bleibt
+        - obj:
+            align: CENTER
+            width: 480
+            height: 480
+            radius: 0
+            border_width: 0
+            pad_all: 0
+            bg_color: 0x000000
+            bg_opa: 55%
+        - label:
+            id: lbl_source
+            align: TOP_MID
+            y: 30
+            width: 440
+            long_mode: WRAP
+            text_align: CENTER
+            text: "Warte auf HA …"
+            text_font: font_small
+            text_color: 0xFF8800
+        - label:
+            id: lbl_title
+            align: CENTER
+            y: -30
+            width: 440
+            long_mode: WRAP
+            text_align: CENTER
+            text: ""
+            text_font: font_big
+            text_color: 0xFFFFFF
+        - label:
+            id: lbl_artist
+            align: CENTER
+            y: 60
+            width: 440
+            long_mode: WRAP
+            text_align: CENTER
+            text: ""
+            text_font: font_small
+            text_color: 0xCCCCCC
+
+    # Wetter, wenn keine Musik läuft
+    - id: page_weather
+      bg_color: 0x000000
+      widgets:
+        # Hintergrundbild nach aktuellem Wetter (480 × 480)
+        - image:
+            id: img_weather_bg
+            src: bg_bedeckt
+            align: CENTER
+        # leichte Abdunklung des ganzen Bildes
+        - obj:
+            align: CENTER
+            width: 480
+            height: 480
+            radius: 0
+            border_width: 0
+            pad_all: 0
+            bg_color: 0x000000
+            bg_opa: 5%
+        # dunkle, halbtransparente Flächen hinter Uhr, aktuellem Wetter und Vorhersage,
+        # damit die Schrift auf jedem Hintergrund lesbar bleibt
+        - obj:
+            align: TOP_MID
+            y: 8
+            width: 300
+            height: 148
+            radius: 18
+            border_width: 0
+            pad_all: 0
+            bg_color: 0x000000
+            bg_opa: 50%
+            scrollable: false
+        - obj:
+            align: CENTER
+            y: -5
+            width: 440
+            height: 130
+            radius: 18
+            border_width: 0
+            pad_all: 0
+            bg_color: 0x000000
+            bg_opa: 50%
+            scrollable: false
+        - obj:
+            align: BOTTOM_MID
+            y: -12
+            width: 460
+            height: 160
+            radius: 18
+            border_width: 0
+            pad_all: 0
+            bg_color: 0x000000
+            bg_opa: 50%
+            scrollable: false
+        - label:
+            id: lbl_clock
+            align: TOP_MID
+            y: 15
+            text: ""
+            text_font: font_clock
+            text_color: 0xFFFFFF
+        - label:
+            id: lbl_date
+            align: TOP_MID
+            y: 115
+            text: ""
+            text_font: font_small
+            text_color: 0xEEEEEE
+        - label:
+            id: lbl_now_icon
+            align: CENTER
+            x: -105
+            y: -10
+            text: ""
+            text_font: font_icon_big
+            text_color: 0xFFFFFF
+        - label:
+            id: lbl_now_temp
+            align: CENTER
+            x: 75
+            y: -35
+            text: ""
+            text_font: font_temp
+            text_color: 0xFFFFFF
+        - label:
+            id: lbl_now_cond
+            align: CENTER
+            x: 75
+            y: 30
+            width: 230
+            long_mode: WRAP
+            text_align: CENTER
+            text: ""
+            text_font: font_small
+            text_color: 0xEEEEEE
+        - label:
+            id: lbl_d1_day
+            align: BOTTOM_MID
+            x: -180
+            y: -150
+            width: 110
+            text_align: CENTER
+            text: ""
+            text_font: font_small
+            text_color: 0xFFA040
+        - label:
+            id: lbl_d1_icon
+            align: BOTTOM_MID
+            x: -180
+            y: -82
+            width: 110
+            text_align: CENTER
+            text: ""
+            text_font: font_icon_small
+            text_color: 0xFFFFFF
+        - label:
+            id: lbl_d1_temp
+            align: BOTTOM_MID
+            x: -180
+            y: -35
+            width: 110
+            text_align: CENTER
+            text: ""
+            text_font: font_small
+            text_color: 0xEEEEEE
+        - label:
+            id: lbl_d2_day
+            align: BOTTOM_MID
+            x: -60
+            y: -150
+            width: 110
+            text_align: CENTER
+            text: ""
+            text_font: font_small
+            text_color: 0xFFA040
+        - label:
+            id: lbl_d2_icon
+            align: BOTTOM_MID
+            x: -60
+            y: -82
+            width: 110
+            text_align: CENTER
+            text: ""
+            text_font: font_icon_small
+            text_color: 0xFFFFFF
+        - label:
+            id: lbl_d2_temp
+            align: BOTTOM_MID
+            x: -60
+            y: -35
+            width: 110
+            text_align: CENTER
+            text: ""
+            text_font: font_small
+            text_color: 0xEEEEEE
+        - label:
+            id: lbl_d3_day
+            align: BOTTOM_MID
+            x: 60
+            y: -150
+            width: 110
+            text_align: CENTER
+            text: ""
+            text_font: font_small
+            text_color: 0xFFA040
+        - label:
+            id: lbl_d3_icon
+            align: BOTTOM_MID
+            x: 60
+            y: -82
+            width: 110
+            text_align: CENTER
+            text: ""
+            text_font: font_icon_small
+            text_color: 0xFFFFFF
+        - label:
+            id: lbl_d3_temp
+            align: BOTTOM_MID
+            x: 60
+            y: -35
+            width: 110
+            text_align: CENTER
+            text: ""
+            text_font: font_small
+            text_color: 0xEEEEEE
+        - label:
+            id: lbl_d4_day
+            align: BOTTOM_MID
+            x: 180
+            y: -150
+            width: 110
+            text_align: CENTER
+            text: ""
+            text_font: font_small
+            text_color: 0xFFA040
+        - label:
+            id: lbl_d4_icon
+            align: BOTTOM_MID
+            x: 180
+            y: -82
+            width: 110
+            text_align: CENTER
+            text: ""
+            text_font: font_icon_small
+            text_color: 0xFFFFFF
+        - label:
+            id: lbl_d4_temp
+            align: BOTTOM_MID
+            x: 180
+            y: -35
+            width: 110
+            text_align: CENTER
+            text: ""
+            text_font: font_small
+            text_color: 0xEEEEEE
+
+# --- Daten aus Home Assistant ---------------------------------------------
+
+# Merkt sich, welches Bild gerade angezeigt wird (verhindert unnötiges Neuladen)
+globals:
+  # gewählter Wetter-Hintergrund (Index in der Bildliste)
+  - id: weather_bg
+    type: int
+    restore_value: no
+    initial_value: '3'
+  # zuletzt gesetzter Modus: 0 = unbekannt, 1 = Musik, 2 = Wetter tags, 3 = Nacht
+  - id: last_mode
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: mode_changed
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Wetterseite per Antippen aufgerufen, obwohl Musik läuft
+  - id: weather_override
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: shown_url
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: target_url
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  # Bild, das gerade geladen wird, und Bildspeicher, der gerade angezeigt wird
+  - id: img_busy
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # seit wann ein Download läuft, und wie oft einer hängen geblieben ist
+  - id: busy_since
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: stuck_count
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: target_key
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: pending_url
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: shown_kind
+    type: int
+    restore_value: no
+    initial_value: '0'
+  # 0 = kein Bild, 1 = Cover JPG, 2 = Cover PNG, 3 = Logo JPG, 4 = Logo PNG
+  - id: target_kind
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+script:
+  # Musik läuft -> Musikseite, sonst Wetterseite (nachts Display aus).
+  # Schaltet nur, wenn sich der Modus ändert, damit manuelle Änderungen nicht
+  # jede Minute überschrieben werden.
+  - id: set_mode
+    mode: queued
+    then:
+      - if:
+          condition:
+            script.is_running: wake
+          then:
+            - logger.log: "Display geweckt, Modus bleibt"
+          else:
+            - lambda: |-
+                int mode;
+                std::string st = id(ma_state).state;
+                std::string md = id(md_modus).has_state() ? id(md_modus).state : "";
+                bool musik;
+                if (md == "phono" || md == "bus" || md == "ext" || md == "nmusic") musik = true;
+                else if (md == "aus") musik = false;
+                else musik = (st == "playing" || st == "paused");  // Rückfall ohne Anzeige-Sensor
+                // nur, wenn im Raum dieses Displays ein Raumplayer läuft (ohne Wert: immer)
+                if (musik && id(raum_aktiv).has_state() && !id(raum_aktiv).state) musik = false;
+                if (musik) {
+                  mode = 1;
+                } else {
+                  auto t = id(ha_time).now();
+                  bool nacht = t.is_valid() && (t.hour >= ${nacht_von} || t.hour < ${nacht_bis});
+                  mode = nacht ? 3 : 2;
+                }
+                id(mode_changed) = (mode != id(last_mode));
+                if (id(mode_changed)) {
+                  id(last_mode) = mode;
+                  id(weather_override) = false;
+                  ESP_LOGI("modus", "Wechsel zu Modus %d", mode);
+                }
+            - if:
+                condition:
+                  lambda: 'return id(mode_changed) && id(last_mode) == 1;'
+                then:
+                  - lvgl.page.show: page_music
+                  - light.turn_on:
+                      id: backlight
+                      brightness: 100%
+            - if:
+                condition:
+                  lambda: 'return id(mode_changed) && id(last_mode) == 2;'
+                then:
+                  - lvgl.page.show: page_weather
+                  - script.execute: apply_brightness
+            - if:
+                condition:
+                  lambda: 'return id(mode_changed) && id(last_mode) == 3;'
+                then:
+                  - lvgl.page.show: page_weather
+                  - light.turn_off: backlight
+
+  # Helligkeit der Wetterseite: Wert aus HA, falls vorhanden, sonst Standardwert
+  - id: apply_brightness
+    then:
+      - if:
+          condition:
+            lambda: 'return !isnan(id(display_hell).state) && id(display_hell).state > 0;'
+          then:
+            - light.turn_on:
+                id: backlight
+                brightness: !lambda 'return id(display_hell).state / 100.0;'
+          else:
+            - light.turn_on:
+                id: backlight
+                brightness: ${helligkeit_wetter}
+
+  # Antippen auswerten. Während Musik läuft: Musik <-> Wetter umschalten.
+  # Sonst: Display wecken. mode single + Pause verhindert Doppelauslösung.
+  - id: touch_action
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: 'return id(last_mode) == 1;'
+          then:
+            - if:
+                condition:
+                  lambda: 'return !id(weather_override);'
+                then:
+                  - lambda: 'id(weather_override) = true;'
+                  - lvgl.page.show: page_weather
+                  - script.execute: weather_timeout
+                else:
+                  - script.stop: weather_timeout
+                  - lambda: 'id(weather_override) = false;'
+                  - lvgl.page.show: page_music
+          else:
+            - script.execute: wake
+      - delay: 600ms
+
+  # Wetterseite bei laufender Musik nach einer Weile automatisch verlassen
+  - id: weather_timeout
+    mode: restart
+    then:
+      - delay: ${wetter_anzeigedauer}
+      - if:
+          condition:
+            lambda: 'return id(last_mode) == 1 && id(weather_override);'
+          then:
+            - lambda: 'id(weather_override) = false;'
+            - lvgl.page.show: page_music
+
+  # Antippen: kurz volle Helligkeit, danach wieder normaler Modus
+  - id: wake
+    mode: restart
+    then:
+      - light.turn_on:
+          id: backlight
+          brightness: 100%
+      - delay: 60s
+      - lambda: 'id(last_mode) = 0;'
+      - script.execute: set_mode
+
+  - id: update_clock
+    then:
+      - lvgl.label.update:
+          id: lbl_clock
+          text: !lambda 'return id(ha_time).now().strftime("%H:%M");'
+      - lvgl.label.update:
+          id: lbl_date
+          text: !lambda |-
+            static const char *tage[] = {"Sonntag", "Montag", "Dienstag", "Mittwoch",
+                                         "Donnerstag", "Freitag", "Samstag"};
+            static const char *monate[] = {"Januar", "Februar", "März", "April", "Mai", "Juni", "Juli",
+                                           "August", "September", "Oktober", "November", "Dezember"};
+            auto t = id(ha_time).now();
+            if (!t.is_valid()) return std::string("");
+            char buf[48];
+            snprintf(buf, sizeof(buf), "%s, %d. %s", tage[t.day_of_week - 1], t.day_of_month, monate[t.month - 1]);
+            return std::string(buf);
+
+  # Fallback, wenn ein Cover nicht geladen werden konnte
+  - id: load_station_logo
+    then:
+      - if:
+          condition:
+            lambda: |-
+              std::string md = id(md_modus).has_state() ? id(md_modus).state : "";
+              if (md == "phono") { id(target_kind) = 5; id(target_key) = "intern:platte"; return true; }
+              if (md == "bus") { id(target_kind) = 6; id(target_key) = "intern:cd"; return true; }
+              return false;
+          then:
+            - script.execute: show_builtin
+            - script.stop: load_station_logo
+      - if:
+          condition:
+            lambda: 'return id(n_logo).has_state() && id(n_logo).state.rfind("http", 0) == 0;'
+          then:
+            - logger.log:
+                format: "Senderlogo: %s"
+                args: ['id(n_logo).state.c_str()']
+            - lambda: 'id(pending_url) = id(n_logo).state; id(target_key) = id(n_logo).state; id(img_busy) = true; id(busy_since) = millis();'
+            - lvgl.widget.hide: img_cover
+            - if:
+                condition:
+                  lambda: |-
+                    std::string u = id(n_logo).state;
+                    for (auto &c : u) c = tolower(c);
+                    return u.find(".png") != std::string::npos;
+                then:
+                  - online_image.set_url:
+                      id: logo_png
+                      url: !lambda 'return id(n_logo).state;'
+                else:
+                  - online_image.set_url:
+                      id: logo_jpg
+                      url: !lambda 'return id(n_logo).state;'
+          else:
+            - logger.log: "Kein Senderlogo hinterlegt"
+            - lvgl.widget.hide: img_cover
+
+  # Entscheidet, welches Bild angezeigt wird:
+  # - echtes Titel-Cover, wenn vorhanden
+  # - bei Internet Radio das eigene Senderlogo statt des kleinen MA-Senderbilds
+  # - Favicons (.ico) werden übersprungen
+  # MA schickt beim Titelwechsel oft mehrere Bilder kurz hintereinander, daher 2 s warten.
+  - id: process_picture
+    mode: restart
+    then:
+      - delay: 2s
+      - lambda: |-
+          auto lower = [](std::string v) { for (auto &c : v) c = tolower(c); return v; };
+          std::string pic = id(ma_picture).has_state() ? id(ma_picture).state : "";
+          std::string logo = id(n_logo).has_state() ? id(n_logo).state : "";
+          std::string quelle = id(n_quelle).has_state() ? id(n_quelle).state : "";
+          std::string lp = lower(pic);
+          bool proxy = lp.find("/imageproxy/") != std::string::npos;
+          bool has_logo = logo.rfind("http", 0) == 0;
+          bool pic_ok = lp.rfind("http", 0) == 0 && lp.find(".ico") == std::string::npos;
+          bool ma_station_img = quelle == "Internet Radio" && proxy;
+
+          std::string local = id(ma_picture_local).has_state() ? id(ma_picture_local).state : "";
+          std::string url, key;
+          int kind = 0;
+          if (pic_ok && !(ma_station_img && has_logo)) {
+            key = pic;
+            url = pic;
+            if (proxy) {
+              // MA-Imageproxy immer als JPEG anfordern (fmt=png -> fmt=jpg)
+              auto p = url.find("fmt=");
+              if (p != std::string::npos) {
+                auto e = url.find('&', p);
+                url.replace(p, (e == std::string::npos ? url.size() : e) - p, "fmt=jpg");
+              } else {
+                url += (url.find('?') == std::string::npos ? "?" : "&") + std::string("fmt=jpg");
+              }
+            } else if (local.rfind("/", 0) == 0) {
+              // externes Cover (https) über den HA-Bildproxy im LAN laden
+              url = std::string("${ha_url}") + local;
+            }
+            kind = (!proxy && lp.find(".png") != std::string::npos) ? 2 : 1;
+          } else if (has_logo) {
+            key = logo;
+            url = logo;
+            kind = lower(logo).find(".png") != std::string::npos ? 4 : 3;
+          }
+          // Plattenspieler, CD & Co. und Fremd-Provider: Bild aus dem Anzeige-Sensor
+          std::string md = id(md_modus).has_state() ? id(md_modus).state : "";
+          if (md == "aus") {
+            // keine Musik: kein Cover laden (spart Speicher und Netz)
+            key = ""; url = ""; kind = 0;
+          } else if (md == "phono" || md == "bus" || md == "ext") {
+            std::string bild = id(md_bild).has_state() ? id(md_bild).state : "";
+            std::string lb = lower(bild);
+            bool nutzbar = !bild.empty() && bild != "None" && lb.find(".svg") == std::string::npos;
+            if (nutzbar) {
+              key = bild;
+              url = (bild.rfind("/", 0) == 0) ? std::string("${ha_url}") + bild : bild;
+              kind = lb.find(".png") != std::string::npos ? 2 : 1;
+            } else if (md == "phono") {
+              key = "intern:platte"; url = ""; kind = 5;
+            } else if (md == "bus") {
+              key = "intern:cd"; url = ""; kind = 6;
+            } else {
+              key = ""; url = ""; kind = 0;
+            }
+          }
+          id(target_url) = url;
+          id(target_key) = key;
+          id(target_kind) = kind;
+      - if:
+          condition:
+            lambda: 'return id(target_kind) == 0;'
+          then:
+            - lambda: 'id(shown_url) = ""; id(shown_kind) = 0;'
+            - lvgl.widget.hide: img_cover
+          else:
+            - if:
+                condition:
+                  lambda: 'return id(target_key) == id(shown_url);'
+                then:
+                  - logger.log: "Bild unverändert, kein neuer Download"
+                else:
+                  - if:
+                      condition:
+                        lambda: 'return id(target_kind) >= 5;'
+                      then:
+                        - script.execute: show_builtin
+                  - if:
+                      condition:
+                        lambda: 'return id(target_kind) < 5;'
+                      then:
+                        - script.execute: start_download
+
+  # Fest eingebautes Bild (Plattenspieler, CD) anzeigen, ohne Download
+  - id: show_builtin
+    then:
+      - if:
+          condition:
+            lambda: 'return id(target_kind) == 5;'
+          then:
+            - lvgl.image.update:
+                id: img_cover
+                src: bg_platte
+      - if:
+          condition:
+            lambda: 'return id(target_kind) == 6;'
+          then:
+            - lvgl.image.update:
+                id: img_cover
+                src: bg_cd
+      - lvgl.widget.show: img_cover
+      - lambda: 'id(shown_url) = id(target_key); id(shown_kind) = id(target_kind);'
+
+  # Download des gewählten Bildes (immer nur einer gleichzeitig)
+  - id: start_download
+    mode: restart
+    then:
+      - wait_until:
+          condition:
+            lambda: 'return !id(img_busy);'
+          timeout: 60s
+      # erst laden, wenn genug zusammenhängender interner Speicher frei ist
+      # (nur für https nötig: TLS braucht ~30 KB am Stück; http aus dem LAN,
+      # z. B. der Cover-Proxy des Pi, lädt sofort)
+      - wait_until:
+          condition:
+            lambda: 'return id(target_url).rfind("http://", 0) == 0 || heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) > 30000;'
+          timeout: 20s
+      - lambda: 'id(pending_url) = id(target_key); id(img_busy) = true; id(busy_since) = millis();'
+      # Vor jedem Download ausblenden: kein Zugriff auf Bildspeicher, die gerade neu belegt werden
+      - lvgl.widget.hide: img_cover
+      - logger.log:
+          format: "Lade Bild: %s"
+          args: ['id(target_url).c_str()']
+      - if:
+          condition:
+            lambda: 'return id(target_kind) == 1;'
+          then:
+            - online_image.set_url:
+                id: cover_img
+                url: !lambda 'return id(target_url);'
+      - if:
+          condition:
+            lambda: 'return id(target_kind) == 2;'
+          then:
+            - online_image.set_url:
+                id: cover_png
+                url: !lambda 'return id(target_url);'
+      - if:
+          condition:
+            lambda: 'return id(target_kind) == 3;'
+          then:
+            - online_image.set_url:
+                id: logo_jpg
+                url: !lambda 'return id(target_url);'
+      - if:
+          condition:
+            lambda: 'return id(target_kind) == 4;'
+          then:
+            - online_image.set_url:
+                id: logo_png
+                url: !lambda 'return id(target_url);'
+
+  # Hintergrund der Wetterseite nach dem aktuellen Wetter (klare Nacht = Sternenhimmel).
+  - id: set_weather_bg
+    then:
+      - lambda: |-
+          // richtet sich nach dem aktuellen Wetter; ohne Wert nach der Tagesvorhersage
+          std::string z = id(w_now).has_state() ? id(w_now).state : "";
+          if (z.empty() || z == "None" || z == "unknown")
+            z = id(w_d1_cond).has_state() ? id(w_d1_cond).state : "";
+          int g = 3;  // bedeckt
+          if (z == "sunny") g = 0;
+          if (z == "partlycloudy" || z == "windy-variant") g = 2;
+          if (z == "cloudy" || z == "fog" || z == "windy" || z == "exceptional") g = 3;
+          if (z == "rainy" || z == "pouring") g = 4;
+          if (z == "lightning" || z == "lightning-rainy" || z == "hail") g = 5;
+          if (z == "snowy" || z == "snowy-rainy") g = 6;
+          if (z == "clear-night") g = 1;
+          id(weather_bg) = g;
+      - if:
+          condition:
+            lambda: 'return id(weather_bg) == 0;'
+          then:
+            - lvgl.image.update:
+                id: img_weather_bg
+                src: bg_sonne
+      - if:
+          condition:
+            lambda: 'return id(weather_bg) == 1;'
+          then:
+            - lvgl.image.update:
+                id: img_weather_bg
+                src: bg_nacht
+      - if:
+          condition:
+            lambda: 'return id(weather_bg) == 2;'
+          then:
+            - lvgl.image.update:
+                id: img_weather_bg
+                src: bg_wolkig
+      - if:
+          condition:
+            lambda: 'return id(weather_bg) == 3;'
+          then:
+            - lvgl.image.update:
+                id: img_weather_bg
+                src: bg_bedeckt
+      - if:
+          condition:
+            lambda: 'return id(weather_bg) == 4;'
+          then:
+            - lvgl.image.update:
+                id: img_weather_bg
+                src: bg_regen
+      - if:
+          condition:
+            lambda: 'return id(weather_bg) == 5;'
+          then:
+            - lvgl.image.update:
+                id: img_weather_bg
+                src: bg_gewitter
+      - if:
+          condition:
+            lambda: 'return id(weather_bg) == 6;'
+          then:
+            - lvgl.image.update:
+                id: img_weather_bg
+                src: bg_schnee
+
+  # Kopfzeile wie in der Karte: "N.MUSIC · Quelle · Inhalt"
+  - id: update_header
+    then:
+      - lvgl.label.update:
+          id: lbl_source
+          text: !lambda |-
+            if (id(md_kopf).has_state() && !id(md_kopf).state.empty() && id(md_kopf).state != "None")
+              return id(md_kopf).state;
+            auto clean = [](std::string v) -> std::string {
+              if (v == "None" || v == "unknown" || v == "unavailable" || v == "–") return "";
+              return v;
+            };
+            std::string q = clean(id(n_quelle).state);
+            std::string i = clean(id(n_inhalt).state);
+            std::string s = "N.MUSIC";
+            if (!q.empty()) s += " · " + q;
+            if (!i.empty()) s += " · " + i;
+            return s;
+
+text_sensor:
+  # Grund des letzten Neustarts (zeigt z. B. Watchdog oder Absturz)
+  - platform: debug
+    reset_reason:
+      name: Neustartgrund
+
+  # Zustand des Players: entscheidet zwischen Musik- und Wetterseite
+  - platform: homeassistant
+    id: ma_state
+    entity_id: ${ma_player}
+    on_value:
+      - script.execute: set_mode
+
+  - platform: homeassistant
+    id: n_quelle
+    entity_id: ${quelle_sensor}
+    on_value:
+      - script.execute: update_header
+
+  - platform: homeassistant
+    id: n_inhalt
+    entity_id: ${inhalt_sensor}
+    on_value:
+      - script.execute: update_header
+
+  - platform: homeassistant
+    id: ma_title
+    entity_id: ${ma_player}
+    attribute: media_title
+    on_value:
+      - if:
+          condition:
+            lambda: 'return !id(md_titel).has_state();'
+          then:
+            - lvgl.label.update:
+                id: lbl_title
+                text: !lambda 'return (x == "None") ? std::string("") : x;'
+
+  - platform: homeassistant
+    id: ma_artist
+    entity_id: ${ma_player}
+    attribute: media_artist
+    on_value:
+      - if:
+          condition:
+            lambda: 'return !id(md_interpret).has_state();'
+          then:
+            - lvgl.label.update:
+                id: lbl_artist
+                text: !lambda 'return (x == "None") ? std::string("") : x;'
+
+  # Cover-URL aus entity_picture (Album-Cover oder Senderlogo)
+  - platform: homeassistant
+    id: ma_picture
+    entity_id: ${ma_player}
+    attribute: entity_picture
+    on_value:
+      - logger.log:
+          format: "Cover-URL: %s"
+          args: ['x.c_str()']
+      - script.execute: process_picture
+
+  # Cover über den HA-Bildproxy (lokale Adresse, z. B. /api/media_player_proxy/...)
+  - platform: homeassistant
+    id: ma_picture_local
+    entity_id: ${ma_player}
+    attribute: entity_picture_local
+
+  # --- Anzeige-Sensor (Plattenspieler, CD, N.MUSIC) ---
+  - platform: homeassistant
+    id: md_modus
+    entity_id: ${anzeige_sensor}
+    on_value:
+      - script.execute: set_mode
+      - script.execute: process_picture
+  - platform: homeassistant
+    id: md_kopf
+    entity_id: ${anzeige_sensor}
+    attribute: kopf
+    on_value:
+      - script.execute: update_header
+  - platform: homeassistant
+    id: md_titel
+    entity_id: ${anzeige_sensor}
+    attribute: titel
+    on_value:
+      - lvgl.label.update:
+          id: lbl_title
+          text: !lambda 'return (x == "None") ? std::string("") : x;'
+  - platform: homeassistant
+    id: md_interpret
+    entity_id: ${anzeige_sensor}
+    attribute: interpret
+    on_value:
+      - lvgl.label.update:
+          id: lbl_artist
+          text: !lambda 'return (x == "None") ? std::string("") : x;'
+  - platform: homeassistant
+    id: md_bild
+    entity_id: ${anzeige_sensor}
+    attribute: bild
+    on_value:
+      - script.execute: process_picture
+
+  # Logo-URL des laufenden Senders (leer, wenn keins hinterlegt)
+  - platform: homeassistant
+    id: n_logo
+    entity_id: ${logo_sensor}
+    on_value:
+      - script.execute: process_picture
+
+  # --- Wetter: aktueller Zustand
+  - platform: homeassistant
+    id: w_now
+    entity_id: ${forecast_sensor}
+    attribute: jetzt_zustand
+    on_value:
+      - script.execute: set_weather_bg
+      - lvgl.label.update:
+          id: lbl_now_icon
+          text: !lambda |-
+            ESP_LOGD("wetter", "Zustand: '%s'", x.c_str());
+            static const std::map<std::string, std::string> icons = {
+              {"clear-night", "\U000F0594"}, {"cloudy", "\U000F0590"},
+              {"exceptional", "\U000F05D6"}, {"fog", "\U000F0591"},
+              {"hail", "\U000F0592"}, {"lightning", "\U000F0593"},
+              {"lightning-rainy", "\U000F067E"}, {"partlycloudy", "\U000F0595"},
+              {"pouring", "\U000F0596"}, {"rainy", "\U000F0597"},
+              {"snowy", "\U000F0598"}, {"snowy-rainy", "\U000F067F"},
+              {"sunny", "\U000F0599"}, {"windy", "\U000F059D"},
+              {"windy-variant", "\U000F059E"}};
+            auto it = icons.find(x);
+            return it != icons.end() ? it->second : std::string("\U000F05D6");
+      - lvgl.label.update:
+          id: lbl_now_cond
+          text: !lambda |-
+            static const std::map<std::string, std::string> texte = {
+              {"clear-night", "Klar"}, {"cloudy", "Bewölkt"}, {"exceptional", "Unwetter"},
+              {"fog", "Nebel"}, {"hail", "Hagel"}, {"lightning", "Gewitter"},
+              {"lightning-rainy", "Gewitter mit Regen"}, {"partlycloudy", "Teilweise bewölkt"},
+              {"pouring", "Starkregen"}, {"rainy", "Regen"}, {"snowy", "Schnee"},
+              {"snowy-rainy", "Schneeregen"}, {"sunny", "Sonnig"}, {"windy", "Windig"},
+              {"windy-variant", "Windig, bewölkt"}};
+            auto it = texte.find(x);
+            return std::string("Jetzt: ") + (it != texte.end() ? it->second : x);
+
+  # --- Vorhersage Tag 1
+  - platform: homeassistant
+    id: w_d1_day
+    entity_id: ${forecast_sensor}
+    attribute: d1_tag
+    on_value:
+      - lvgl.label.update:
+          id: lbl_d1_day
+          text: !lambda 'return x;'
+  - platform: homeassistant
+    id: w_d1_cond
+    entity_id: ${forecast_sensor}
+    attribute: d1_zustand
+    on_value:
+      - script.execute: set_weather_bg
+      - lvgl.label.update:
+          id: lbl_d1_icon
+          text: !lambda |-
+            ESP_LOGD("wetter", "Zustand: '%s'", x.c_str());
+            static const std::map<std::string, std::string> icons = {
+              {"clear-night", "\U000F0594"}, {"cloudy", "\U000F0590"},
+              {"exceptional", "\U000F05D6"}, {"fog", "\U000F0591"},
+              {"hail", "\U000F0592"}, {"lightning", "\U000F0593"},
+              {"lightning-rainy", "\U000F067E"}, {"partlycloudy", "\U000F0595"},
+              {"pouring", "\U000F0596"}, {"rainy", "\U000F0597"},
+              {"snowy", "\U000F0598"}, {"snowy-rainy", "\U000F067F"},
+              {"sunny", "\U000F0599"}, {"windy", "\U000F059D"},
+              {"windy-variant", "\U000F059E"}};
+            auto it = icons.find(x);
+            return it != icons.end() ? it->second : std::string("\U000F05D6");
+  - platform: homeassistant
+    id: w_d1_temp
+    entity_id: ${forecast_sensor}
+    attribute: d1_temp
+    on_value:
+      - lvgl.label.update:
+          id: lbl_d1_temp
+          text: !lambda 'return x;'
+
+  # --- Vorhersage Tag 2
+  - platform: homeassistant
+    id: w_d2_day
+    entity_id: ${forecast_sensor}
+    attribute: d2_tag
+    on_value:
+      - lvgl.label.update:
+          id: lbl_d2_day
+          text: !lambda 'return x;'
+  - platform: homeassistant
+    id: w_d2_cond
+    entity_id: ${forecast_sensor}
+    attribute: d2_zustand
+    on_value:
+      - lvgl.label.update:
+          id: lbl_d2_icon
+          text: !lambda |-
+            ESP_LOGD("wetter", "Zustand: '%s'", x.c_str());
+            static const std::map<std::string, std::string> icons = {
+              {"clear-night", "\U000F0594"}, {"cloudy", "\U000F0590"},
+              {"exceptional", "\U000F05D6"}, {"fog", "\U000F0591"},
+              {"hail", "\U000F0592"}, {"lightning", "\U000F0593"},
+              {"lightning-rainy", "\U000F067E"}, {"partlycloudy", "\U000F0595"},
+              {"pouring", "\U000F0596"}, {"rainy", "\U000F0597"},
+              {"snowy", "\U000F0598"}, {"snowy-rainy", "\U000F067F"},
+              {"sunny", "\U000F0599"}, {"windy", "\U000F059D"},
+              {"windy-variant", "\U000F059E"}};
+            auto it = icons.find(x);
+            return it != icons.end() ? it->second : std::string("\U000F05D6");
+  - platform: homeassistant
+    id: w_d2_temp
+    entity_id: ${forecast_sensor}
+    attribute: d2_temp
+    on_value:
+      - lvgl.label.update:
+          id: lbl_d2_temp
+          text: !lambda 'return x;'
+
+  # --- Vorhersage Tag 3
+  - platform: homeassistant
+    id: w_d3_day
+    entity_id: ${forecast_sensor}
+    attribute: d3_tag
+    on_value:
+      - lvgl.label.update:
+          id: lbl_d3_day
+          text: !lambda 'return x;'
+  - platform: homeassistant
+    id: w_d3_cond
+    entity_id: ${forecast_sensor}
+    attribute: d3_zustand
+    on_value:
+      - lvgl.label.update:
+          id: lbl_d3_icon
+          text: !lambda |-
+            ESP_LOGD("wetter", "Zustand: '%s'", x.c_str());
+            static const std::map<std::string, std::string> icons = {
+              {"clear-night", "\U000F0594"}, {"cloudy", "\U000F0590"},
+              {"exceptional", "\U000F05D6"}, {"fog", "\U000F0591"},
+              {"hail", "\U000F0592"}, {"lightning", "\U000F0593"},
+              {"lightning-rainy", "\U000F067E"}, {"partlycloudy", "\U000F0595"},
+              {"pouring", "\U000F0596"}, {"rainy", "\U000F0597"},
+              {"snowy", "\U000F0598"}, {"snowy-rainy", "\U000F067F"},
+              {"sunny", "\U000F0599"}, {"windy", "\U000F059D"},
+              {"windy-variant", "\U000F059E"}};
+            auto it = icons.find(x);
+            return it != icons.end() ? it->second : std::string("\U000F05D6");
+  - platform: homeassistant
+    id: w_d3_temp
+    entity_id: ${forecast_sensor}
+    attribute: d3_temp
+    on_value:
+      - lvgl.label.update:
+          id: lbl_d3_temp
+          text: !lambda 'return x;'
+
+  # --- Vorhersage Tag 4
+  - platform: homeassistant
+    id: w_d4_day
+    entity_id: ${forecast_sensor}
+    attribute: d4_tag
+    on_value:
+      - lvgl.label.update:
+          id: lbl_d4_day
+          text: !lambda 'return x;'
+  - platform: homeassistant
+    id: w_d4_cond
+    entity_id: ${forecast_sensor}
+    attribute: d4_zustand
+    on_value:
+      - lvgl.label.update:
+          id: lbl_d4_icon
+          text: !lambda |-
+            ESP_LOGD("wetter", "Zustand: '%s'", x.c_str());
+            static const std::map<std::string, std::string> icons = {
+              {"clear-night", "\U000F0594"}, {"cloudy", "\U000F0590"},
+              {"exceptional", "\U000F05D6"}, {"fog", "\U000F0591"},
+              {"hail", "\U000F0592"}, {"lightning", "\U000F0593"},
+              {"lightning-rainy", "\U000F067E"}, {"partlycloudy", "\U000F0595"},
+              {"pouring", "\U000F0596"}, {"rainy", "\U000F0597"},
+              {"snowy", "\U000F0598"}, {"snowy-rainy", "\U000F067F"},
+              {"sunny", "\U000F0599"}, {"windy", "\U000F059D"},
+              {"windy-variant", "\U000F059E"}};
+            auto it = icons.find(x);
+            return it != icons.end() ? it->second : std::string("\U000F05D6");
+  - platform: homeassistant
+    id: w_d4_temp
+    entity_id: ${forecast_sensor}
+    attribute: d4_temp
+    on_value:
+      - lvgl.label.update:
+          id: lbl_d4_temp
+          text: !lambda 'return x;'
+
+sensor:
+  # freier Speicher, um Lecks zu erkennen
+  - platform: debug
+    free:
+      name: Freier Heap
+    block:
+      name: Größter freier Block
+    psram:
+      name: Freies PSRAM
+
+  # aktuelle Temperatur (METAR, sonst Wetterdienst) aus dem Vorhersage-Sensor
+  - platform: homeassistant
+    id: w_now_temp
+    entity_id: ${forecast_sensor}
+    attribute: jetzt_temp
+    on_value:
+      - lvgl.label.update:
+          id: lbl_now_temp
+          text: !lambda |-
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%.0f°", x);
+            return std::string(buf);
+
+  # Zielhelligkeit für die Wetterseite in Prozent (aus HA)
+  - platform: homeassistant
+    id: display_hell
+    entity_id: ${helligkeit_sensor}
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(last_mode) == 2 && !id(wake).is_running();'
+          then:
+            - script.execute: apply_brightness
+
+binary_sensor:
+  # läuft im Raum dieses Displays einer der eingetragenen Raumplayer?
+  - platform: homeassistant
+    id: raum_aktiv
+    entity_id: ${raum_sensor}
+    on_state:
+      - script.execute: set_mode
