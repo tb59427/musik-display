@@ -24,8 +24,8 @@ The on-screen texts and the comments in the YAML are German.
 - **Weather page:** current condition and temperature, 4-day forecast,
   background picture matching the weather.
 - **Room awareness:** the display only switches to music when one of the
-  B&O players in *its* room plays. The list of players is a text entity
-  ("Raumplayer") on the device, editable in Home Assistant.
+  B&O players in *its* room plays. The list of players is an `input_text`
+  helper in Home Assistant, one per display.
 - **Touch:** while music plays, a tap toggles music ↔ weather; the weather
   page returns to music after `wetter_anzeigedauer`.
 - **Brightness** follows a light sensor in the room (or the sun's
@@ -51,7 +51,7 @@ The on-screen texts and the comments in the YAML are German.
 | `secrets.yaml.example` | Template for the secrets it uses |
 | `wetter/` | Background pictures (not included, see [wetter/README.md](wetter/README.md)) |
 | `ha/musik-display-sensor.yaml` | `sensor.musik_display`: what to show (phono / bus / ext / nmusic / aus), header, title, artist, picture |
-| `ha/raum-aktiv.yaml` | `binary_sensor.musik_display_raum_aktiv`: is a player in this display's room on? |
+| `ha/raum-aktiv.yaml` | `input_text.musik_display_raumplayer` (the room's players) and `binary_sensor.musik_display_raum_aktiv`: is one of them on? |
 | `ha/wetter-daily.yaml` | `sensor.wetter_daily`: daily/hourly forecast of a weather entity as a sensor |
 | `ha/wetter-vorhersage.yaml` | `sensor.wetter_vorhersage_display`: current weather and 4-day forecast, prepared for the display; uses a METAR sensor for "now" if you have one |
 | `ha/display-helligkeit.yaml` | `sensor.display_helligkeit`: target brightness from a light sensor or the sun |
@@ -76,8 +76,8 @@ The on-screen texts and the comments in the YAML are German.
    - brightness, weather page timeout and night hours.
 4. Install from the ESPHome dashboard (first time via USB, then OTA), and
    adopt the device in Home Assistant.
-5. In Home Assistant, open the device and enter the room's players in
-   **Raumplayer**, comma-separated, e.g.
+5. In Home Assistant, enter the room's players in the helper
+   **Musik-Display Raumplayer**, comma-separated, e.g.
    `media_player.beovision_10, media_player.beolab_3500`. Empty means: react
    to any music.
 

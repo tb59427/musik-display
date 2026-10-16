@@ -81,18 +81,8 @@ captive_portal:
 debug:
   update_interval: 30s
 
-# Liste der Raumplayer, in HA einstellbar (kommagetrennte Entity-IDs).
-# Leer = Display reagiert auf jede Musik (wie bisher).
-text:
-  - platform: template
-    name: Raumplayer
-    id: raumplayer
-    icon: mdi:speaker-multiple
-    mode: text
-    optimistic: true
-    restore_value: true
-    initial_value: ""
-    max_length: 255
+# Die Liste der Raumplayer liegt in HA (input_text, siehe ha/raum-aktiv.yaml),
+# das Display liest nur das Ergebnis (raum_sensor).
 
 # --- Hardware -------------------------------------------------------------
 

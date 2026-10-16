@@ -1,6 +1,7 @@
 # Raumbezug für die Musik-Displays
 #
-# Jedes Display hat in HA eine Text-Entität "Raumplayer". Dort trägst du die
+# Jedes Display hat in HA einen Helfer "Raumplayer" (input_text, unten). Dort
+# trägst du die
 # B&O-Player dieses Raums ein, kommagetrennt, z. B.:
 #   media_player.beovision_10, media_player.beolab_3500
 # Der Sensor unten wird "an", sobald einer davon läuft. Nur dann zeigt das
@@ -8,11 +9,21 @@
 # Leere Liste = Display reagiert auf jede Musik.
 #
 # Pro Display ein Eintrag: Namen anpassen (z. B. "Musik-Display Bad Raum aktiv"
-# mit text.musik_display_bad_raumplayer). Die Entity-ID muss im Display unter
+# mit input_text.musik_display_bad_raumplayer). Die Entity-ID muss im Display unter
 # substitutions bei raum_sensor stehen.
 #
-# Gibt es in der configuration.yaml schon "template:", nur den Teil ab
-# "- binary_sensor:" dort anhängen.
+# Der Helfer liegt in HA, nicht auf dem Display: so übersteht der Wert
+# Neustarts von HA und Display (eine Template-Text-Entität auf dem ESP32 hat
+# ihn nach einem OTA-Update verloren).
+#
+# Gibt es in der configuration.yaml schon "input_text:" bzw. "template:", nur
+# die Einträge darunter dort anhängen.
+
+input_text:
+  musik_display_raumplayer:
+    name: Musik-Display Raumplayer
+    icon: mdi:speaker-multiple
+    max: 255
 
 template:
   - binary_sensor:
@@ -20,7 +31,7 @@ template:
         unique_id: musik_display_raum_aktiv
         icon: mdi:speaker-wireless
         state: >-
-          {%- set liste = states('text.musik_display_raumplayer') -%}
+          {%- set liste = states('input_text.musik_display_raumplayer') -%}
           {%- set player = (liste if liste not in ['unknown', 'unavailable'] else '')
                 .split(',') | map('trim') | select | list -%}
           {%- if player | count == 0 -%}
@@ -30,7 +41,7 @@ template:
           {%- endif -%}
         attributes:
           laufende_player: >-
-            {%- set liste = states('text.musik_display_raumplayer') -%}
+            {%- set liste = states('input_text.musik_display_raumplayer') -%}
             {%- set player = (liste if liste not in ['unknown', 'unavailable'] else '')
                   .split(',') | map('trim') | select | list -%}
             {{ player | select('is_state', ['playing', 'on', 'paused']) | list | join(', ') }}
@@ -39,4 +50,4 @@ template:
       # - name: Musik-Display Bad Raum aktiv
       #   unique_id: musik_display_bad_raum_aktiv
       #   state: >-
-      #     ... wie oben, mit text.musik_display_bad_raumplayer
+      #     ... wie oben, mit input_text.musik_display_bad_raumplayer
