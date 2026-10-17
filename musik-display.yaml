@@ -964,6 +964,16 @@ script:
             } else {
               key = ""; url = ""; kind = 0;
             }
+          } else if (md == "nmusic") {
+            // Internetradio: nachgeschlagenes Cover des Titels (über den
+            // Bildproxy von HA, also http im LAN), sonst wie oben Cover/Logo von MA
+            std::string bild = id(md_bild).has_state() ? id(md_bild).state : "";
+            std::string bid = id(md_bild_id).has_state() ? id(md_bild_id).state : "";
+            if (bild.rfind("/", 0) == 0 && !bid.empty() && bid != "None") {
+              key = bid;
+              url = std::string("${ha_url}") + bild;
+              kind = 1;
+            }
           }
           id(target_url) = url;
           id(target_key) = key;
@@ -1249,6 +1259,14 @@ text_sensor:
     id: md_bild
     entity_id: ${anzeige_sensor}
     attribute: bild
+    on_value:
+      - script.execute: process_picture
+  # Kennung des Radio-Covers: bleibt gleich, solange das Cover gleich bleibt
+  # (die Proxy-URL in "bild" wechselt mit dem Zugriffstoken von HA)
+  - platform: homeassistant
+    id: md_bild_id
+    entity_id: ${anzeige_sensor}
+    attribute: bild_id
     on_value:
       - script.execute: process_picture
 

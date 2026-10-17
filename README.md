@@ -16,7 +16,9 @@ The on-screen texts and the comments in the YAML are German.
 - **Music page:** cover (or station logo), title, artist, and a header line
   with source and album. Sources:
   - N.MUSIC via Music Assistant: title, artist, cover or station logo from
-    the MA player;
+    the MA player; for internet radio optionally the track's cover looked up
+    by mdtv2-tools' `n_music_radio_cover` template (Radio Swiss playlist
+    API, iTunes), loaded through HA's image proxy;
   - N.MUSIC from other providers (AirPlay, Spotify Connect, …), the
     turntable, and other MasterLink sources such as the CD player:
     recognized title, artist, album and cover from mdtv2-tools. Without a
@@ -50,7 +52,7 @@ The on-screen texts and the comments in the YAML are German.
 | `musik-display.yaml` | ESPHome configuration of the display |
 | `secrets.yaml.example` | Template for the secrets it uses |
 | `wetter/` | Background pictures (not included, see [wetter/README.md](wetter/README.md)) |
-| `ha/musik-display-sensor.yaml` | `sensor.musik_display`: what to show (phono / bus / ext / nmusic / aus), header, title, artist, picture |
+| `ha/musik-display-sensor.yaml` | `sensor.musik_display`: what to show (phono / bus / ext / nmusic / aus), header, title, artist, picture and picture id |
 | `ha/raum-aktiv.yaml` | `input_text.musik_display_raumplayer` (the room's players) and `binary_sensor.musik_display_raum_aktiv`: is one of them on? |
 | `ha/wetter-daily.yaml` | `sensor.wetter_daily`: daily/hourly forecast of a weather entity as a sensor |
 | `ha/wetter-vorhersage.yaml` | `sensor.wetter_vorhersage_display`: current weather and 4-day forecast, prepared for the display; uses a METAR sensor for "now" if you have one |

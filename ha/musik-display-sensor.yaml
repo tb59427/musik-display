@@ -9,6 +9,11 @@
 #
 # Zustand: phono | bus | ext | nmusic | aus
 #
+# Radio-Cover (optional): nutzt sensor.n_music_radio_cover und
+# image.n_music_radio_cover aus mdtv2-tools
+# (home-assistant/templates/n_music_radio_cover.yaml). Ohne die bleibt
+# "bild" bei Radio leer und das Display zeigt Cover/Logo von Music Assistant.
+#
 # Gibt es in der configuration.yaml schon "template:", nur den Teil ab
 # "- sensor:" dort anhängen.
 
@@ -73,17 +78,36 @@ template:
             {%- else -%}
               {{ state_attr('media_player.masterlink_bridge_ma', 'media_artist') or '' }}
             {%- endif -%}
-          # Bild nur für Plattenspieler, Bus-Quelle und Fremd-Provider (sonst leer:
-          # dann nutzt das Display wie bisher das Cover bzw. Senderlogo von MA)
+          # Bild für Plattenspieler, Bus-Quelle, Fremd-Provider und Radio mit
+          # gefundenem Cover (sonst leer: dann nutzt das Display wie bisher das
+          # Cover bzw. Senderlogo von MA)
           bild: >-
             {%- set phono = is_state('sensor.mdt_phono', 'playing') -%}
             {%- set bus = not phono and is_state('sensor.mdt_ml_listen', 'playing') -%}
             {%- set prov = state_attr('sensor.mdt_n_music', 'provider') or '' -%}
             {%- set ext = is_state('sensor.mdt_n_music', 'playing') and prov not in ['', 'sendspin'] -%}
+            {%- set rc = state_attr('sensor.n_music_radio_cover', 'cover_url') or '' -%}
+            {%- set radio_cover = not phono and not bus and not ext and rc != ''
+                  and state_attr('sensor.n_music_radio_cover', 'titel') == state_attr('media_player.masterlink_bridge_ma', 'media_title')
+                  and is_state('media_player.masterlink_bridge_ma', 'playing') -%}
             {%- if phono -%}
               {{ state_attr('sensor.mdt_phono', 'cover_url') or '' if state_attr('sensor.mdt_phono', 'artist') else '' }}
             {%- elif bus -%}
               {{ state_attr('sensor.mdt_ml_listen', 'cover_url') or '' if state_attr('sensor.mdt_ml_listen', 'artist') else '' }}
             {%- elif ext -%}
               {{ state_attr('sensor.mdt_n_music', 'cover_url') or '' }}
+            {%- elif radio_cover -%}
+              {{ state_attr('image.n_music_radio_cover', 'entity_picture') or '' }}
             {%- endif -%}
+          # Kennung des Bildes: ändert sich nur mit dem Cover (die Proxy-URL des
+          # Radio-Covers wechselt sonst mit jedem neuen Zugriffstoken)
+          bild_id: >-
+            {%- set phono = is_state('sensor.mdt_phono', 'playing') -%}
+            {%- set bus = not phono and is_state('sensor.mdt_ml_listen', 'playing') -%}
+            {%- set prov = state_attr('sensor.mdt_n_music', 'provider') or '' -%}
+            {%- set ext = is_state('sensor.mdt_n_music', 'playing') and prov not in ['', 'sendspin'] -%}
+            {%- set rc = state_attr('sensor.n_music_radio_cover', 'cover_url') or '' -%}
+            {%- set radio_cover = not phono and not bus and not ext and rc != ''
+                  and state_attr('sensor.n_music_radio_cover', 'titel') == state_attr('media_player.masterlink_bridge_ma', 'media_title')
+                  and is_state('media_player.masterlink_bridge_ma', 'playing') -%}
+            {{ rc if radio_cover else '' }}
