@@ -118,9 +118,13 @@ output:
     id: backlight_out
 
 light:
+  # Nur intern: Helligkeit und Nachtruhe regelt das Display selbst. Als Licht in
+  # HA würde es sonst von Bereichsaktionen ("alle Lichter im Wohnzimmer aus")
+  # mitgeschaltet.
   - platform: monochromatic
     name: Hintergrundbeleuchtung
     id: backlight
+    internal: true
     output: backlight_out
     restore_mode: ALWAYS_ON
     # ohne Gammakorrektur entspricht der Prozentwert der tatsächlichen Helligkeit
